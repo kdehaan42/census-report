@@ -7,6 +7,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import mutual_info_classif
 from sklearn.metrics import accuracy_score, classification_report
@@ -61,57 +63,100 @@ def plot_label_correlations(data, label_col="label"):
     return fig
 
 
-def show_column_distributions(data, include_columns=None, max_categories=20):
-    """Show column distributions and help identify outliers."""
+def show_column_distributions(data, include_columns=None, max_categories=20, save_dir="data_review"):
+    """Show column distributions and save histogram + stats per column."""
     if data is None or data.empty:
         print("No data available to plot distributions.")
         return None
 
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+
     include_columns = include_columns or data.columns.tolist()
-    for col in include_columns:
-        if col not in data.columns:
-            print(f"Skipping missing column: {col}")
-            continue
+    plot_columns = [col for col in include_columns if col in data.columns]
+    if not plot_columns:
+        print("No valid columns found to plot.")
+        return None
 
-        series = data[col].dropna()
+    saved_files = []
+    stats_list = []
+
+    for col in plot_columns:
+        series = data[col]
         if series.empty:
-            print(f"Column '{col}' is empty after dropping nulls.")
+            print(f"Column '{col}' is empty.")
             continue
 
-        if pd.api.types.is_numeric_dtype(series):
-            q1 = series.quantile(0.25)
-            q3 = series.quantile(0.75)
-            iqr = q3 - q1
-            lower = q1 - 1.5 * iqr
-            upper = q3 + 1.5 * iqr
-            outliers = series[(series < lower) | (series > upper)]
-            print(
-                f"{col}: numeric distribution, {len(outliers)} outliers, "
-                f"IQR={iqr:.3f}, lower={lower:.3f}, upper={upper:.3f}"
-            )
-            fig = px.histogram(
-                data,
-                x=col,
-                nbins=50,
-                marginal="box",
-                title=f"{col} distribution with box plot",
-                labels={col: col},
-            )
-            fig.update_layout(bargap=0.1)
-            # fig.show()
+        series_non_null = series.dropna()
+        stats = {
+            "column": col,
+            "count": int(series.count()),
+            "missing": int(series.isna().sum()),
+            "unique": int(series_non_null.nunique()),
+        }
 
-        else:
-            counts = series.value_counts().nlargest(max_categories)
-            print(f"{col}: categorical distribution, {series.nunique()} unique values")
-            fig = px.bar(
-                x=counts.index.astype(str),
-                y=counts.values,
-                labels={"x": col, "y": "count"},
-                title=f"{col} value counts (top {len(counts)})",
+        if pd.api.types.is_numeric_dtype(series_non_null):
+            describe = series_non_null.describe()
+            stats.update(
+                {
+                    "mean": float(describe.get("mean", np.nan)),
+                    "std": float(describe.get("std", np.nan)),
+                    "min": float(describe.get("min", np.nan)),
+                    "25%": float(describe.get("25%", np.nan)),
+                    "50%": float(describe.get("50%", np.nan)),
+                    "75%": float(describe.get("75%", np.nan)),
+                    "max": float(describe.get("max", np.nan)),
+                }
             )
-            fig.update_layout(xaxis_tickangle=-45)
-            # fig.show()
-    return True
+            fig = go.Figure(
+                data=[go.Histogram(x=series_non_null, marker_color="steelblue")],
+                layout=dict(
+                    title=f"{col} distribution",
+                    xaxis_title=col,
+                    yaxis_title="count",
+                ),
+            )
+        else:
+            counts = series_non_null.value_counts().nlargest(max_categories)
+            top_values = counts.to_dict()
+            stats.update({f"top_{i+1}": k for i, k in enumerate(top_values.keys())})
+            stats.update({f"top_{i+1}_count": int(v) for i, v in enumerate(top_values.values())})
+            fig = go.Figure(
+                data=[
+                    go.Bar(
+                        x=[str(v) for v in counts.index],
+                        y=counts.values,
+                        marker_color="steelblue",
+                    )
+                ],
+                layout=dict(
+                    title=f"{col} value counts",
+                    xaxis_title=col,
+                    yaxis_title="count",
+                ),
+            )
+
+        fig_file = save_path / f"{col.replace(' ', '_')}_distribution.png"
+        fig.write_image(str(fig_file), format="png")
+        print(f"Saved distribution figure for '{col}' to {fig_file}")
+
+        stats_file = save_path / f"{col.replace(' ', '_')}_stats.json"
+        with stats_file.open("w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
+        print(f"Saved stats for '{col}' to {stats_file}")
+
+        saved_files.append({
+            "column": col,
+            "figure": str(fig_file),
+            "stats": str(stats_file),
+        })
+        stats_list.append(stats)
+
+    summary_csv = save_path / "column_stats_summary.csv"
+    pd.DataFrame(stats_list).to_csv(summary_csv, index=False)
+    print(f"Saved column stats summary to {summary_csv}")
+
+    return saved_files
 
 
 def determine_feature_impact(data, label_col="label", method="mutual_info"):
@@ -646,6 +691,8 @@ if __name__ == "__main__":
         help="Number of cross-validation folds when tuning.",
     )
     args = parser.parse_args()
+
+    show_column_distributions(load_data(args.train_file))
 
     train_data = load_data(args.train_file)
     test_data = load_data(args.test_file)
