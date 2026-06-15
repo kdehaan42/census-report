@@ -17,6 +17,11 @@ from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.tree import plot_tree
 
+try:
+    import xgboost as xgb
+except ImportError:
+    xgb = None
+
 
 def load_data(file_path):
     """Load data from a CSV file."""
@@ -793,6 +798,151 @@ def train_logistic_regression(
     )
 
 
+def train_xgboost(
+    train_data,
+    test_data,
+    label_col="label",
+    random_state=42,
+    n_estimators=100,
+    max_depth=6,
+    learning_rate=0.1,
+    subsample=0.8,
+    colsample_bytree=0.8,
+):
+    """Train an XGBoost classifier using pre-split train and test DataFrames."""
+    if xgb is None:
+        raise ImportError(
+            "XGBoost is not installed. Install xgboost to use this training function."
+        )
+    if train_data is None or train_data.empty:
+        raise ValueError("No train data available to train.")
+    if test_data is None or test_data.empty:
+        raise ValueError("No test data available to evaluate.")
+
+    if label_col not in train_data.columns:
+        if label_col in test_data.columns:
+            print(
+                f"Label column '{label_col}' not found in train data but present in test data."
+            )
+        else:
+            label_col = train_data.columns[-1]
+            print(
+                f"Label column not found; using last train column '{label_col}' instead."
+            )
+
+    combined = pd.concat([train_data, test_data], axis=0, ignore_index=True)
+
+    combined_encoded = one_hot_encode_numeric_columns(
+        combined,
+        numeric_cols=["industry code", "occupation code", "veterans benefits"],
+        exclude_cols=[label_col],
+    )
+    combined_encoded = one_hot_encode_strings(
+        combined_encoded, exclude_cols=[label_col]
+    )
+
+    train_encoded = combined_encoded.iloc[: len(train_data)].copy()
+    test_encoded = combined_encoded.iloc[len(train_data) :].copy()
+
+    if label_col not in train_encoded.columns or label_col not in test_encoded.columns:
+        raise KeyError(f"Label column '{label_col}' not found after encoding.")
+
+    X_train = train_encoded.drop(columns=[label_col])
+    y_train = train_encoded[label_col]
+    X_test = test_encoded.drop(columns=[label_col])
+    y_test = test_encoded[label_col]
+
+    sanitized_columns = sanitize_feature_names(X_train.columns.tolist())
+    X_train.columns = sanitized_columns
+    X_test.columns = sanitized_columns
+
+    label_mapping = None
+    if not pd.api.types.is_numeric_dtype(y_train):
+        combined_labels = pd.concat([y_train, y_test], ignore_index=True)
+        combined_codes, uniques = pd.factorize(combined_labels)
+        y_train = pd.Series(combined_codes[: len(y_train)], index=y_train.index)
+        y_test = pd.Series(combined_codes[len(y_train) :], index=y_test.index)
+        label_mapping = [str(value) for value in uniques]
+
+    model = xgb.XGBClassifier(
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        learning_rate=learning_rate,
+        subsample=subsample,
+        colsample_bytree=colsample_bytree,
+        random_state=random_state,
+        use_label_encoder=False,
+        eval_metric="logloss",
+        n_jobs=-1,
+    )
+    model.fit(X_train, y_train)
+
+    model_dir = Path("model_outputs")
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = model_dir / "xgboost_model.joblib"
+    joblib.dump(model, model_path)
+    print(f"Saved trained XGBoost model to {model_path}")
+
+    importance_image_path = model_dir / "xgboost_feature_importances.png"
+    feature_importances = pd.Series(
+        model.feature_importances_, index=X_train.columns
+    ).sort_values(ascending=True)
+    fig, ax = plt.subplots(figsize=(10, 14))
+    feature_importances.tail(25).plot(kind="barh", ax=ax)
+    ax.set_title("Top 25 Feature Importances (XGBoost)")
+    ax.set_xlabel("Importance")
+    fig.tight_layout()
+    fig.savefig(importance_image_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved feature importance plot to {importance_image_path}")
+
+    y_pred = model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, zero_division=0)
+
+    metadata = {
+        "feature_columns": X_train.columns.tolist(),
+        "label_col": label_col,
+        "label_mapping": label_mapping,
+        "model_type": "xgboost",
+    }
+    metadata_path = model_dir / "xgboost_model_metadata.json"
+    with metadata_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Saved model metadata to {metadata_path}")
+
+    print(f"XGBoost accuracy: {accuracy:.4f}")
+    print("Classification report:\n", report)
+    return (
+        model,
+        accuracy,
+        report,
+        model_path,
+        importance_image_path,
+        metadata_path,
+    )
+
+
+def sanitize_feature_names(columns):
+    """Return a sanitized list of feature names safe for XGBoost."""
+    sanitized = []
+    seen = {}
+    for idx, col in enumerate(columns):
+        name = str(col)
+        name = name.replace("[", "_").replace("]", "_").replace("<", "_").replace(">", "_")
+        name = name.replace(" ", "_")
+        if name == "":
+            name = f"feature_{idx}"
+        if name in seen:
+            seen[name] += 1
+            name = f"{name}_{seen[name]}"
+        else:
+            seen[name] = 0
+        sanitized.append(name)
+    return sanitized
+
+
 def load_model_and_metadata(model_path=None, metadata_path=None):
     """Load a saved Random Forest model and its feature metadata."""
     model_path = Path(model_path or "model_outputs/random_forest_model.joblib")
@@ -910,7 +1060,7 @@ def run_saved_random_forest(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Train or run the saved Random Forest model."
+        description="Train, run, or tune machine learning models on the census dataset."
     )
     parser.add_argument(
         "--mode",
@@ -935,7 +1085,7 @@ if __name__ == "__main__":
         "--n-estimators",
         type=int,
         default=100,
-        help="Number of estimators when training the Random Forest.",
+        help="Number of estimators when training random forest or XGBoost.",
     )
     parser.add_argument(
         "--n-iter",
@@ -945,9 +1095,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--model",
-        choices=["rf", "logistic"],
+        choices=["rf", "logistic", "xgboost"],
         default="rf",
-        help="Which model to tune when using --mode tune: 'rf' or 'logistic'.",
+        help="Which model to train or tune: 'rf', 'logistic', or 'xgboost'.",
     )
     parser.add_argument(
         "--cv",
@@ -960,6 +1110,30 @@ if __name__ == "__main__":
         type=int,
         default=1000,
         help="Maximum iterations for logistic regression.",
+    )
+    parser.add_argument(
+        "--xgb-max-depth",
+        type=int,
+        default=6,
+        help="Maximum tree depth for XGBoost.",
+    )
+    parser.add_argument(
+        "--xgb-learning-rate",
+        type=float,
+        default=0.1,
+        help="Learning rate for XGBoost.",
+    )
+    parser.add_argument(
+        "--xgb-subsample",
+        type=float,
+        default=0.8,
+        help="Subsample ratio for XGBoost.",
+    )
+    parser.add_argument(
+        "--xgb-colsample-bytree",
+        type=float,
+        default=0.8,
+        help="Colsample by tree ratio for XGBoost.",
     )
     args = parser.parse_args()
 
@@ -989,17 +1163,31 @@ if __name__ == "__main__":
     )
 
     if args.mode == "train":
-        train_random_forest(
-            train_data,
-            test_data,
-            label_col=args.label_col,
-            n_estimators=args.n_estimators,
-        )
-        train_logistic_regression(
-            train_data,
-            test_data,
-            label_col=args.label_col,
-        )
+        if args.model == "rf":
+            train_random_forest(
+                train_data,
+                test_data,
+                label_col=args.label_col,
+                n_estimators=args.n_estimators,
+            )
+        elif args.model == "logistic":
+            train_logistic_regression(
+                train_data,
+                test_data,
+                label_col=args.label_col,
+                max_iter=args.max_iter,
+            )
+        elif args.model == "xgboost":
+            train_xgboost(
+                train_data,
+                test_data,
+                label_col=args.label_col,
+                n_estimators=args.n_estimators,
+                max_depth=args.xgb_max_depth,
+                learning_rate=args.xgb_learning_rate,
+                subsample=args.xgb_subsample,
+                colsample_bytree=args.xgb_colsample_bytree,
+            )
     elif args.mode == "run":
         run_saved_random_forest(
             test_data,
@@ -1015,11 +1203,15 @@ if __name__ == "__main__":
                 n_iter=args.n_iter,
                 cv=args.cv,
             )
-        else:
+        elif args.model == "logistic":
             tune_logistic_regression_hyperparams(
                 train_data,
                 test_data,
                 label_col=args.label_col,
                 n_iter=args.n_iter,
                 cv=args.cv,
+            )
+        else:
+            print(
+                "Tuning for xgboost is not implemented yet. Use --mode train --model xgboost to train XGBoost."
             )
