@@ -9,8 +9,10 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import re
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import mutual_info_classif
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score, classification_report
 from sklearn.model_selection import RandomizedSearchCV
 from sklearn.tree import plot_tree
@@ -352,6 +354,91 @@ def tune_random_forest_hyperparams(
     return best, rsearch.best_params_, results_df, model_path
 
 
+def tune_logistic_regression_hyperparams(
+    train_data,
+    test_data,
+    label_col="label",
+    n_iter=20,
+    cv=3,
+    random_state=42,
+    param_distributions=None,
+    save_dir="model_outputs",
+):
+    """Run randomized search to tune Logistic Regression hyperparameters.
+
+    Returns: best_estimator, best_params, results_df, model_path
+    """
+    if train_data is None or train_data.empty:
+        raise ValueError("No train data provided for tuning.")
+
+    if label_col not in train_data.columns:
+        label_col = train_data.columns[-1]
+
+    # combine to ensure consistent encoding
+    combined = (
+        pd.concat([train_data, test_data], axis=0, ignore_index=True)
+        if test_data is not None
+        else train_data.copy()
+    )
+    combined_encoded = one_hot_encode_numeric_columns(
+        combined,
+        numeric_cols=["industry code", "occupation code", "veterans benefits"],
+        exclude_cols=[label_col],
+    )
+    combined_encoded = one_hot_encode_strings(combined_encoded, exclude_cols=[label_col])
+
+    train_encoded = combined_encoded.iloc[: len(train_data)].copy()
+
+    if label_col not in train_encoded.columns:
+        raise KeyError(f"Label column '{label_col}' not found after encoding.")
+
+    X = train_encoded.drop(columns=[label_col])
+    y = train_encoded[label_col]
+    if not pd.api.types.is_numeric_dtype(y):
+        y = pd.factorize(y)[0]
+
+    # Default search space
+    if param_distributions is None:
+        param_distributions = {
+            "C": [0.001, 0.01, 0.1, 1, 10, 100],
+            "penalty": ["l2", "l1", "elasticnet", "none"],
+            "solver": ["liblinear", "saga", "lbfgs"],
+            "l1_ratio": [0.0, 0.25, 0.5, 0.75, 1.0],
+            "max_iter": [200, 500, 1000],
+        }
+
+    clf = LogisticRegression(random_state=random_state)
+    # Some parameter combinations are invalid for certain solvers/penalties.
+    # Use error_score=np.nan so failed fits are recorded and search continues.
+    rsearch = RandomizedSearchCV(
+        clf,
+        param_distributions=param_distributions,
+        n_iter=n_iter,
+        cv=cv,
+        random_state=random_state,
+        n_jobs=-1,
+        verbose=1,
+        error_score=np.nan,
+    )
+
+    rsearch.fit(X, y)
+
+    best = rsearch.best_estimator_
+    results_df = pd.DataFrame(rsearch.cv_results_)
+
+    out_dir = Path(save_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_path = out_dir / "logistic_regression_tuned_model.joblib"
+    joblib.dump(best, model_path)
+    results_csv = out_dir / "logistic_random_search_results.csv"
+    results_df.to_csv(results_csv, index=False)
+
+    print(f"Saved tuned logistic regression model to {model_path}")
+    print(f"Saved search results to {results_csv}")
+
+    return best, rsearch.best_params_, results_df, model_path
+
+
 def one_hot_encode_strings(data, exclude_cols=None):
     """One-hot encode all string columns in the DataFrame."""
     if data is None or data.empty:
@@ -372,6 +459,75 @@ def one_hot_encode_strings(data, exclude_cols=None):
     print(f"One-hot encoding columns: {obj_cols}")
     encoded = pd.get_dummies(data, columns=obj_cols, dummy_na=False, drop_first=False)
     return encoded
+
+
+def group_education_levels(df, col="education", new_col="education_group"):
+    """Group education values into broader categories.
+
+    Categories:
+    - "Didn't finish High School"
+    - "Finished High School"
+    - "Finished Associates"
+    - "Finished Bachelors"
+    - "Has Grad Degree"
+
+    Adds a new column `new_col` to the DataFrame and returns the DataFrame.
+    """
+    if df is None:
+        return df
+    if col not in df.columns:
+        raise KeyError(f"Column '{col}' not found in DataFrame")
+
+    # Map exact values from the CSV to the requested groups
+    dont_finish = {
+        "less than 1st grade",
+        "1st 2nd 3rd or 4th grade",
+        "5th or 6th grade",
+        "7th and 8th grade",
+        "9th grade",
+        "10th grade",
+        "11th grade",
+        "12th grade no diploma",
+        "children",
+    }
+
+    finished_high = {"high school graduate", "some college but no degree"}
+
+    finished_associates = {
+        "associates degree-academic program",
+        "associates degree-occup /vocational",
+    }
+
+    finished_bachelors = {"bachelors degree(ba ab bs)"}
+
+    grad = {
+        "masters degree(ma ms meng med msw mba)",
+        "doctorate degree(phd edd)",
+        "prof school degree (md dds dvm llb jd)",
+    }
+
+    def _map_edu(val):
+        if pd.isna(val):
+            return np.nan
+        v = str(val).strip()
+        key = v.lower()
+
+        if key in dont_finish:
+            return "Didn't finish High School"
+        if key in finished_high:
+            return "Finished High School"
+        if key in finished_associates:
+            return "Finished Associates"
+        if key in finished_bachelors:
+            return "Finished Bachelors"
+        if key in grad:
+            return "Has Grad Degree"
+
+        # fallback heuristics
+        return "Finished High School"
+
+    df[new_col] = df[col].apply(_map_edu)
+    return df
 
 
 def one_hot_encode_numeric_columns(data, numeric_cols=None, exclude_cols=None):
@@ -534,6 +690,109 @@ def train_random_forest(
     )
 
 
+def train_logistic_regression(
+    train_data, test_data, label_col="label", random_state=42, max_iter=1000
+):
+    """Train a Logistic Regression classifier using pre-split train and test DataFrames."""
+    if train_data is None or train_data.empty:
+        raise ValueError("No train data available to train.")
+    if test_data is None or test_data.empty:
+        raise ValueError("No test data available to evaluate.")
+
+    if label_col not in train_data.columns:
+        if label_col in test_data.columns:
+            print(
+                f"Label column '{label_col}' not found in train data but present in test data."
+            )
+        else:
+            label_col = train_data.columns[-1]
+            print(
+                f"Label column not found; using last train column '{label_col}' instead."
+            )
+
+    combined = pd.concat([train_data, test_data], axis=0, ignore_index=True)
+
+    combined_encoded = one_hot_encode_numeric_columns(
+        combined,
+        numeric_cols=["industry code", "occupation code", "veterans benefits"],
+        exclude_cols=[label_col],
+    )
+    combined_encoded = one_hot_encode_strings(
+        combined_encoded, exclude_cols=[label_col]
+    )
+
+    train_encoded = combined_encoded.iloc[: len(train_data)].copy()
+    test_encoded = combined_encoded.iloc[len(train_data) :].copy()
+
+    if label_col not in train_encoded.columns or label_col not in test_encoded.columns:
+        raise KeyError(f"Label column '{label_col}' not found after encoding.")
+
+    X_train = train_encoded.drop(columns=[label_col])
+    y_train = train_encoded[label_col]
+    X_test = test_encoded.drop(columns=[label_col])
+    y_test = test_encoded[label_col]
+
+    label_mapping = None
+    if not pd.api.types.is_numeric_dtype(y_train):
+        combined_labels = pd.concat([y_train, y_test], ignore_index=True)
+        combined_codes, uniques = pd.factorize(combined_labels)
+        y_train = pd.Series(combined_codes[: len(y_train)], index=y_train.index)
+        y_test = pd.Series(combined_codes[len(y_train) :], index=y_test.index)
+        label_mapping = [str(value) for value in uniques]
+
+    model = LogisticRegression(
+        max_iter=max_iter, random_state=random_state, n_jobs=-1
+    )
+    model.fit(X_train, y_train)
+
+    model_dir = Path("model_outputs")
+    model_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = model_dir / "logistic_regression_model.joblib"
+    joblib.dump(model, model_path)
+    print(f"Saved trained logistic regression model to {model_path}")
+
+    # Save coefficients as a visualization
+    coefficients = pd.Series(
+        np.abs(model.coef_[0]) if model.coef_.shape[0] == 1 else np.abs(model.coef_).mean(axis=0),
+        index=X_train.columns,
+    ).sort_values(ascending=True)
+    coef_image_path = model_dir / "logistic_regression_coefficients.png"
+    fig, ax = plt.subplots(figsize=(10, 14))
+    coefficients.tail(25).plot(kind="barh", ax=ax)
+    ax.set_title("Top 25 Feature Coefficients (Logistic Regression)")
+    ax.set_xlabel("Absolute Coefficient Value")
+    fig.tight_layout()
+    fig.savefig(coef_image_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved coefficient plot to {coef_image_path}")
+
+    y_pred = model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, zero_division=0)
+
+    metadata = {
+        "feature_columns": X_train.columns.tolist(),
+        "label_col": label_col,
+        "label_mapping": label_mapping,
+    }
+    metadata_path = model_dir / "logistic_regression_model_metadata.json"
+    with metadata_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
+    print(f"Saved model metadata to {metadata_path}")
+
+    print(f"Logistic Regression accuracy: {accuracy:.4f}")
+    print("Classification report:\n", report)
+    return (
+        model,
+        accuracy,
+        report,
+        model_path,
+        coef_image_path,
+        metadata_path,
+    )
+
+
 def load_model_and_metadata(model_path=None, metadata_path=None):
     """Load a saved Random Forest model and its feature metadata."""
     model_path = Path(model_path or "model_outputs/random_forest_model.joblib")
@@ -685,17 +944,31 @@ if __name__ == "__main__":
         help="Number of RandomizedSearchCV iterations when tuning.",
     )
     parser.add_argument(
+        "--model",
+        choices=["rf", "logistic"],
+        default="rf",
+        help="Which model to tune when using --mode tune: 'rf' or 'logistic'.",
+    )
+    parser.add_argument(
         "--cv",
         type=int,
         default=3,
         help="Number of cross-validation folds when tuning.",
     )
+    parser.add_argument(
+        "--max-iter",
+        type=int,
+        default=1000,
+        help="Maximum iterations for logistic regression.",
+    )
     args = parser.parse_args()
 
-    show_column_distributions(load_data(args.train_file))
+    # show_column_distributions(load_data(args.train_file))
 
     train_data = load_data(args.train_file)
     test_data = load_data(args.test_file)
+    group_education_levels(train_data, col="education", new_col="education_group")
+    group_education_levels(test_data, col="education", new_col="education_group")
     columns_to_drop = [
         "instance weight",
         "total person income",
@@ -703,6 +976,7 @@ if __name__ == "__main__":
         "capital losses",
         "divdends from stocks",
         "wage per hour",
+        "education"
     ]
     train_data = drop_columns(train_data, columns_to_drop=columns_to_drop)
     test_data = drop_columns(test_data, columns_to_drop=columns_to_drop)
@@ -721,6 +995,11 @@ if __name__ == "__main__":
             label_col=args.label_col,
             n_estimators=args.n_estimators,
         )
+        train_logistic_regression(
+            train_data,
+            test_data,
+            label_col=args.label_col,
+        )
     elif args.mode == "run":
         run_saved_random_forest(
             test_data,
@@ -728,10 +1007,19 @@ if __name__ == "__main__":
             output_path="model_outputs/run_predictions.csv",
         )
     elif args.mode == "tune":
-        tune_random_forest_hyperparams(
-            train_data,
-            test_data,
-            label_col=args.label_col,
-            n_iter=args.n_iter,
-            cv=args.cv,
-        )
+        if args.model == "rf":
+            tune_random_forest_hyperparams(
+                train_data,
+                test_data,
+                label_col=args.label_col,
+                n_iter=args.n_iter,
+                cv=args.cv,
+            )
+        else:
+            tune_logistic_regression_hyperparams(
+                train_data,
+                test_data,
+                label_col=args.label_col,
+                n_iter=args.n_iter,
+                cv=args.cv,
+            )
