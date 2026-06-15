@@ -3,7 +3,7 @@
 Tools for preprocessing, exploring, training and tuning classifiers on the Census income dataset.
 
 Includes:
-- [main.py](main.py): preprocessing, training, running, and tuning (Random Forest + Logistic Regression)
+- [main.py](main.py): preprocessing, training, running, and tuning (Random Forest + Logistic Regression + XGBoost)
 - [add_csv_headers.py](add_csv_headers.py): apply column headers from `census_income_metadata.txt` to CSVs
 - census CSVs: `census_income_learn.csv`, `census_income_test.csv`
 
@@ -14,6 +14,7 @@ Includes:
 - Train models:
 	- Random Forest (`train_random_forest`) — saves model, an example tree image, feature importances, and metadata.
 	- Logistic Regression (`train_logistic_regression`) — saves model, coefficient plot, and metadata.
+	- XGBoost (`train_xgboost`) — trains an `XGBClassifier`, saves model, feature importances, and metadata (requires the `xgboost` package).
 - Hyperparameter tuning via `RandomizedSearchCV`:
 	- Random Forest: `tune_random_forest_hyperparams`
 	- Logistic Regression: `tune_logistic_regression_hyperparams`
@@ -25,6 +26,7 @@ Includes:
 - `model_outputs/random_forest_tuned_model.joblib`, `random_search_results.csv`
 - `model_outputs/logistic_regression_model.joblib`, `logistic_regression_model_metadata.json`
 - `model_outputs/logistic_regression_tuned_model.joblib`, `logistic_random_search_results.csv`
+- `model_outputs/xgboost_model.joblib`, `xgboost_model_metadata.json`
 - `model_outputs/run_predictions.csv` (original inputs + predictions + true labels when available)
 - `data_review/` (per-column PNGs/JSON and `column_stats_summary.csv`)
 
@@ -36,6 +38,8 @@ Install dependencies:
 
 ```bash
 python3 -m pip install pandas numpy matplotlib plotly scikit-learn joblib
+# Optional: install XGBoost if you plan to train XGBoost models
+python3 -m pip install xgboost
 ```
 
 ## Usage examples
@@ -44,6 +48,13 @@ python3 -m pip install pandas numpy matplotlib plotly scikit-learn joblib
 
 ```bash
 python3 main.py --mode train --train-file census_income_learn.csv --test-file census_income_test.csv
+```
+
+- Train XGBoost (requires the `xgboost` package):
+
+```bash
+python3 main.py --mode train --model xgboost --train-file census_income_learn.csv --test-file census_income_test.csv \
+	--n-estimators 200 --xgb-max-depth 6 --xgb-learning-rate 0.1
 ```
 
 - Run saved Random Forest model on test file and write predictions:
